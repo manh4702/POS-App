@@ -7,8 +7,9 @@ const api = axios.create({
     headers: {
         'Content-Type': 'application/json'
     },
-    timeout: 5000,
-    withCredentials: true
+    timeout: 30000,
+    withCredentials: true,
+    responseType: 'json'
 });
 
 // Thêm interceptors để xử lý lỗi

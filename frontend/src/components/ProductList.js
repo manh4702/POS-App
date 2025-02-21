@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Table, Button, Modal, Form, Input, InputNumber, Select, message, Popconfirm, Space, Card, Checkbox, Divider } from 'antd';
+import { Table, Button, Modal, Form, Input, InputNumber, Select, message, Popconfirm, Space, Card, Checkbox, Divider, Upload } from 'antd';
 import api from '../utils/api';
-import { BarcodeOutlined, SearchOutlined, DownloadOutlined, PlusOutlined } from '@ant-design/icons';
+import { BarcodeOutlined, SearchOutlined, DownloadOutlined, PlusOutlined, UploadOutlined } from '@ant-design/icons';
 import eventBus from '../utils/eventBus';
 import JsBarcode from 'jsbarcode';
 import { ScannerModal } from '../utils/barcodeScanner';
+import { saveAs } from 'file-saver';
 
 const ProductList = ({ categories, onCategoryChange }) => {
     const [products, setProducts] = useState([]);
@@ -44,6 +45,7 @@ const ProductList = ({ categories, onCategoryChange }) => {
             setProducts(response.data);
             setFilteredProducts(response.data);
         } catch (error) {
+            console.error('Error fetching products:', error);
             message.error('Không thể lấy danh sách sản phẩm');
         }
     };
@@ -182,26 +184,30 @@ const ProductList = ({ categories, onCategoryChange }) => {
 
     const handleSubmit = async (values) => {
         try {
-            const formData = {
-                ...values,
-                name: values.name.trim(),
-                barcode: values.barcode?.trim() || generateBarcode(),
-                wholesale_price: hasWholesale ? values.wholesale_price : null
-            };
-
-            // Ensure category_id is included in formData
-            if (!formData.category_id) {
+            const barcodeValue = values.barcode ? values.barcode.trim() : '';
+            
+            if (!values.category_id) {
                 message.error('Vui lòng chọn danh mục!');
                 return;
             }
 
-            // Send formData to the API
+            console.log('Form values:', values);
+            
+            const formData = {
+                ...values,
+                name: values.name.trim(),
+                barcode: barcodeValue || generateBarcode(),
+                retail_price: Number(values.retail_price),
+                wholesale_price: hasWholesale ? Number(values.wholesale_price) : null,
+            };
+
+            console.log('FormData being sent:', formData);
+
             if (editingId) {
                 const response = await api.put(`/api/products/${editingId}`, formData);
                 if (response.data) {
                     message.success('Cập nhật sản phẩm thành công');
                     setIsModalVisible(false);
-                    setEditingId(null);
                     form.resetFields();
                     fetchProducts();
                 }
@@ -216,9 +222,61 @@ const ProductList = ({ categories, onCategoryChange }) => {
             }
         } catch (error) {
             console.error('Submit error:', error);
-            const errorMessage = error.response?.data?.error || `Không thể ${editingId ? 'cập nhật' : 'thêm'} sản phẩm`;
+            const errorMessage = error.response?.data?.error || 'Không thể lưu sản phẩm';
             message.error(errorMessage);
         }
+    };
+
+    // Sửa lại validateBarcode để không block submit khi không có mã vạch
+    const validateBarcode = async (_, value) => {
+        if (!value || value.trim() === '') {
+            return Promise.resolve(); // Cho phép trống
+        }
+        
+        const barcodeValue = value.trim();
+
+        // Kiểm tra định dạng mã vạch (chỉ chứa số)
+        if (!/^\d+$/.test(barcodeValue)) {
+            return Promise.reject('Mã vạch chỉ được chứa số');
+        }
+
+        // Kiểm tra độ dài mã vạch hợp lệ
+        const validLengths = {
+            'EAN-13': 13,
+            'EAN-8': 8,
+            'UPC-A': 12,
+            'UPC-E': 8,
+            'Code-11': [7, 8, 9, 10, 11],
+            'Code-39': [1, 43],
+            'Code-128': [1, 48],
+            'ITF': [6, 8, 10, 12, 14, 16]
+        };
+
+        let isValidLength = false;
+        for (const [, lengths] of Object.entries(validLengths)) {
+            if (Array.isArray(lengths)) {
+                if (Array.isArray(lengths[0])) {
+                    isValidLength = barcodeValue.length >= lengths[0] && barcodeValue.length <= lengths[1];
+                } else {
+                    isValidLength = lengths.includes(barcodeValue.length);
+                }
+            } else {
+                isValidLength = barcodeValue.length === lengths;
+            }
+            if (isValidLength) break;
+        }
+
+        if (!isValidLength) {
+            return Promise.reject('Độ dài mã vạch không hợp lệ');
+        }
+
+        // Kiểm tra mã vạch đã tồn tại
+        const exists = await checkBarcode(barcodeValue, editingId);
+        if (exists) {
+            return Promise.reject('Mã vạch đã tồn tại');
+        }
+
+        return Promise.resolve();
     };
 
     const handleBarcodeDetected = (code) => {
@@ -247,11 +305,21 @@ const ProductList = ({ categories, onCategoryChange }) => {
         setFilteredProducts(result);
     }, [products, selectedCategory, searchText]);
 
-    // Hàm tạo mã vạch ngẫu nhiên
+    // Sửa lại hàm tạo mã vạch tự động
     const generateBarcode = () => {
-        const prefix = '200'; // Prefix cho mã vạch của bạn
-        const random = Math.floor(Math.random() * 1000000000).toString().padStart(9, '0');
-        return prefix + random;
+        // Tạo mã vạch EAN-13
+        const prefix = '200'; // Prefix cố định cho mã nội bộ
+        const middle = Math.floor(Math.random() * 1000000000).toString().padStart(9, '0');
+        const fullCode = prefix + middle;
+        
+        // Tính check digit cho EAN-13
+        let sum = 0;
+        for (let i = 0; i < 12; i++) {
+            sum += parseInt(fullCode[i]) * (i % 2 === 0 ? 1 : 3);
+        }
+        const checkDigit = (10 - (sum % 10)) % 10;
+        
+        return fullCode + checkDigit;
     };
 
     // Hàm tạo và tải mã vạch
@@ -348,10 +416,118 @@ const ProductList = ({ categories, onCategoryChange }) => {
         }
     };
 
+    const handleExport = async () => {
+        try {
+            const response = await api.get('/api/products/export', { 
+                responseType: 'blob',
+                headers: {
+                    'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                }
+            });
+
+            // Lấy tên file từ Content-Disposition header nếu có
+            const contentDisposition = response.headers['content-disposition'];
+            let filename = 'products.xlsx';
+            if (contentDisposition) {
+                const filenameMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
+                if (filenameMatch) {
+                    filename = filenameMatch[1].replace(/['"]/g, '');
+                }
+            }
+
+            // Tạo Blob và download
+            const blob = new Blob([response.data], { 
+                type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' 
+            });
+            saveAs(blob, filename);
+            
+            message.success('Xuất file thành công');
+        } catch (error) {
+            console.error('Export error:', error);
+            message.error('Không thể xuất file Excel');
+        }
+    };
+
+    const handleImport = async (file) => {
+        try {
+            const formData = new FormData();
+            formData.append('file', file);
+
+            const response = await api.post('/api/products/import', formData, {
+                headers: { 'Content-Type': 'multipart/form-data' }
+            });
+
+            // Hiển thị thông báo chi tiết về kết quả import
+            if (response.data.categories.success > 0) {
+                message.success(`Đã import ${response.data.categories.success} danh mục thành công`);
+            }
+            
+            if (response.data.products.success > 0) {
+                message.success(`Đã import ${response.data.products.success} sản phẩm thành công`);
+                // Tự động cập nhật danh sách sản phẩm
+                await fetchProducts();
+            }
+
+            // Hiển thị các lỗi nếu có
+            const errors = [
+                ...response.data.categories.errors,
+                ...response.data.products.errors
+            ];
+
+            if (errors.length > 0) {
+                Modal.warning({
+                    title: 'Có một số lỗi trong quá trình import',
+                    content: (
+                        <ul>
+                            {errors.map((error, index) => (
+                                <li key={index}>{error}</li>
+                            ))}
+                        </ul>
+                    ),
+                    width: 500
+                });
+            }
+
+            // Cập nhật danh mục nếu có thay đổi
+            if (response.data.categories.success > 0) {
+                // Gọi hàm cập nhật danh mục từ props
+                await onCategoryChange();
+            }
+
+        } catch (error) {
+            console.error('Import error:', error);
+            Modal.error({
+                title: 'Lỗi Import',
+                content: 'Không thể import file. Vui lòng kiểm tra định dạng file và thử lại.',
+                width: 500
+            });
+        }
+    };
+
     return (
         <div className="p-6">
             <div className="flex justify-between mb-4">
                 <h1 className="text-2xl font-bold">Quản lý sản phẩm</h1>
+                <div>
+                    <Button 
+                        type="primary" 
+                        icon={<DownloadOutlined />} 
+                        onClick={handleExport}
+                        className="mr-2"
+                    >
+                        Xuất Excel
+                    </Button>
+                    <Upload 
+                        accept=".xlsx,.xls"
+                        showUploadList={false}
+                        beforeUpload={(file) => {
+                            handleImport(file);
+                            return false;
+                        }}
+                    >
+                        <Button icon={<UploadOutlined />}>Import Excel</Button>
+                    </Upload>
+                </div>
                 <Button type="primary" onClick={() => {
                     setEditingId(null);
                     form.resetFields();
@@ -466,31 +642,28 @@ const ProductList = ({ categories, onCategoryChange }) => {
                         label="Mã vạch"
                         rules={[
                             {
-                                validator: async (_, value) => {
-                                    if (value) {
-                                        const exists = await checkBarcode(value, editingId);
-                                        if (exists) {
-                                            throw new Error('Mã vạch đã tồn tại');
-                                        }
-                                    }
-                                }
+                                validator: validateBarcode,
                             }
                         ]}
-                        help="Để trống để tự động tạo mã vạch"
+                        validateTrigger={['onChange', 'onBlur']}
+                        help="Để trống để tự động tạo mã vạch EAN-13"
                     >
-                        <Space.Compact style={{ width: '100%' }}>
-                            <Input />
-                            <Button 
-                                icon={<BarcodeOutlined />}
-                                onClick={() => setScannerVisible(true)}
-                            />
-                        </Space.Compact>
-                        <Form.Item noStyle shouldUpdate>
-                            {({ getFieldValue }) => (
-                                <BarcodePreview value={getFieldValue('barcode')} />
-                            )}
-                        </Form.Item>
+                        <Input
+                            suffix={
+                                <Button
+                                    type="link"
+                                    icon={<BarcodeOutlined />}
+                                    onClick={() => setScannerVisible(true)}
+                                />
+                            }
+                        />
                     </Form.Item>
+
+                    {form.getFieldValue('barcode') && (
+                        <div className="barcode-preview">
+                            <BarcodePreview value={form.getFieldValue('barcode')} />
+                        </div>
+                    )}
 
                     <Form.Item
                         name="retail_price"
@@ -502,9 +675,6 @@ const ProductList = ({ categories, onCategoryChange }) => {
                                     if (value < 0) {
                                         return Promise.reject('Giá không thể âm');
                                     }
-                                    if (value % 1000 !== 0) {
-                                        return Promise.reject('Giá phải là bội số của 1000đ');
-                                    }
                                     return Promise.resolve();
                                 }
                             }
@@ -512,7 +682,6 @@ const ProductList = ({ categories, onCategoryChange }) => {
                     >
                         <InputNumber
                             min={0}
-                            step={1000}
                             style={{ width: '100%' }}
                             formatter={value => `${value}`.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
                             parser={value => value.replace(/\$\s?|(,*)/g, '')}
@@ -530,33 +699,31 @@ const ProductList = ({ categories, onCategoryChange }) => {
                     </Form.Item>
 
                     {hasWholesale && (
-                        <Form.Item
-                            name="wholesale_price"
-                            label="Giá sỉ (VND)"
-                            rules={[
-                                { required: true, message: 'Vui lòng nhập giá sỉ!' },
-                                {
-                                    validator: (_, value) => {
-                                        if (value < 0) {
-                                            return Promise.reject('Giá không thể âm');
+                        <>
+                            <Form.Item
+                                name="wholesale_price"
+                                label="Giá sỉ (VND)"
+                                rules={[
+                                    { required: true, message: 'Vui lòng nhập giá sỉ!' },
+                                    {
+                                        validator: (_, value) => {
+                                            if (value < 0) {
+                                                return Promise.reject('Giá không thể âm');
+                                            }
+                                            return Promise.resolve();
                                         }
-                                        if (value % 1000 !== 0) {
-                                            return Promise.reject('Giá phải là bội số của 1000đ');
-                                        }
-                                        return Promise.resolve();
                                     }
-                                }
-                            ]}
-                        >
-                            <InputNumber
-                                min={0}
-                                step={1000}
-                                style={{ width: '100%' }}
-                                formatter={value => `${value}`.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
-                                parser={value => value.replace(/\$\s?|(,*)/g, '')}
-                                addonAfter="VND"
-                            />
-                        </Form.Item>
+                                ]}
+                            >
+                                <InputNumber
+                                    min={0}
+                                    style={{ width: '100%' }}
+                                    formatter={value => `${value}`.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
+                                    parser={value => value.replace(/\$\s?|(,*)/g, '')}
+                                    addonAfter="VND"
+                                />
+                            </Form.Item>
+                        </>
                     )}
 
                     <Form.Item

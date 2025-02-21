@@ -1,10 +1,9 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-// Kiểm tra xem có đang chạy trong Electron không
-const isElectron = process.versions.electron !== undefined;
+// Log để debug
+console.log('Preload script starting...');
 
-if (isElectron) {
-    // Đảm bảo API được expose chỉ khi đang chạy trong Electron
+try {
     contextBridge.exposeInMainWorld(
         'electron',
         {
@@ -20,12 +19,10 @@ if (isElectron) {
                     ipcRenderer.on(channel, (event, ...args) => func(...args));
                 }
             },
-            // Thêm flag để kiểm tra môi trường
             isElectron: true
         }
     );
-
-    console.log('Preload script loaded in Electron environment');
-} else {
-    console.log('Not running in Electron environment');
+    console.log('Preload script completed successfully');
+} catch (error) {
+    console.error('Error in preload script:', error);
 } 

@@ -1,6 +1,9 @@
 const express = require('express');
 const cors = require('cors');
 const { createDbConnection } = require('./database');
+const multer = require('multer');
+const XLSX = require('xlsx');
+const upload = multer({ storage: multer.memoryStorage() });
 
 function setupServer(db) {
     const app = express();
@@ -9,8 +12,9 @@ function setupServer(db) {
     app.use(cors({
         origin: ['http://localhost:3000', 'http://127.0.0.1:3000'],
         methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization'],
-        credentials: true
+        allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
+        credentials: true,
+        exposedHeaders: ['Content-Disposition']
     }));
 
     // Middleware
@@ -20,8 +24,121 @@ function setupServer(db) {
         next();
     });
 
-    // API Routes - Sắp xếp theo thứ tự từ cụ thể đến chung
-    // 1. Products Routes
+    // Thêm route này sau middleware và trước các routes khác
+    app.get('/api/products', (req, res) => {
+        db.all(`
+            SELECT p.*, c.name as category_name 
+            FROM products p 
+            LEFT JOIN categories c ON p.category_id = c.id
+        `, [], (err, rows) => {
+            if (err) {
+                console.error('Error fetching products:', err);
+                res.status(500).json({ error: err.message });
+                return;
+            }
+            res.json(rows);
+        });
+    });
+
+    // API Routes
+    // 1. Export/Import Routes (đặt trước các routes khác)
+    app.get('/api/products/export', async (req, res) => {
+        try {
+            // 1. Lấy danh sách danh mục
+            const categories = await new Promise((resolve, reject) => {
+                db.all(`SELECT name FROM categories ORDER BY name`, [], (err, rows) => {
+                    if (err) reject(err);
+                    else resolve(rows.map(row => row.name));
+                });
+            });
+
+            // 2. Lấy danh sách sản phẩm
+            const products = await new Promise((resolve, reject) => {
+                db.all(`
+                    SELECT 
+                        p.name,
+                        p.barcode,
+                        p.retail_price,
+                        p.wholesale_price,
+                        c.name as category_name
+                    FROM products p 
+                    LEFT JOIN categories c ON p.category_id = c.id
+                `, [], (err, rows) => {
+                    if (err) reject(err);
+                    else resolve(rows);
+                });
+            });
+
+            // 3. Format dữ liệu sản phẩm
+            const formattedProducts = products.map(product => ({
+                'Tên sản phẩm': product.name,
+                'Mã vạch': product.barcode || '',
+                'Giá lẻ': product.retail_price,
+                'Giá sỉ': product.wholesale_price || '',
+                'Danh mục': product.category_name
+            }));
+
+            // 4. Tạo workbook
+            const wb = XLSX.utils.book_new();
+
+            // 5. Tạo sheet sản phẩm
+            const wsProducts = XLSX.utils.json_to_sheet(formattedProducts, {
+                header: ['Tên sản phẩm', 'Mã vạch', 'Giá lẻ', 'Giá sỉ', 'Danh mục']
+            });
+
+            // 6. Thiết lập độ rộng cột cho sheet sản phẩm
+            wsProducts['!cols'] = [
+                { wch: 30 }, // Tên sản phẩm
+                { wch: 15 }, // Mã vạch
+                { wch: 15 }, // Giá lẻ
+                { wch: 15 }, // Giá sỉ
+                { wch: 20 }  // Danh mục
+            ];
+
+            // 7. Tạo data validation cho cột danh mục
+            const range = {
+                s: { r: 1, c: 4 },  // Bắt đầu từ hàng 1 (sau header), cột 4 (cột Danh mục)
+                e: { r: 1000, c: 4 } // Kết thúc ở hàng 1000
+            };
+
+            if (!wsProducts['!validations']) wsProducts['!validations'] = [];
+            wsProducts['!validations'].push({
+                sqref: XLSX.utils.encode_range(range),
+                type: 'list',
+                formula1: `"${categories.join(',')}"`,
+                showDropDown: true
+            });
+
+            // 8. Tạo sheet danh mục
+            const formattedCategories = categories.map(name => ({ 'Tên danh mục': name }));
+            const wsCategories = XLSX.utils.json_to_sheet(formattedCategories, {
+                header: ['Tên danh mục']
+            });
+
+            // 9. Thiết lập độ rộng cột cho sheet danh mục
+            wsCategories['!cols'] = [{ wch: 30 }];
+
+            // 10. Thêm các sheet vào workbook
+            XLSX.utils.book_append_sheet(wb, wsProducts, 'Danh sách sản phẩm');
+            XLSX.utils.book_append_sheet(wb, wsCategories, 'Danh mục');
+
+            // 11. Tạo buffer và gửi file
+            const buffer = XLSX.write(wb, { 
+                type: 'buffer', 
+                bookType: 'xlsx',
+                bookSST: false
+            });
+
+            res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+            res.setHeader('Content-Disposition', 'attachment; filename=products_and_categories.xlsx');
+            res.send(buffer);
+        } catch (error) {
+            console.error('Export error:', error);
+            res.status(500).json({ error: 'Failed to export data' });
+        }
+    });
+
+    // 2. Products Routes
     // 1.1 Search products
     app.get('/api/products/search', (req, res) => {
         const searchTerm = req.query.q?.toLowerCase();
@@ -417,6 +534,168 @@ function setupServer(db) {
             }
             res.json({ exists: !!row });
         });
+    });
+
+    // Import products from Excel
+    app.post('/api/products/import', upload.single('file'), async (req, res) => {
+        try {
+            if (!req.file) {
+                return res.status(400).json({ error: 'Không tìm thấy file' });
+            }
+
+            console.log('Importing file:', req.file.originalname); // Log tên file
+
+            const workbook = XLSX.read(req.file.buffer);
+            console.log('Available sheets:', workbook.SheetNames); // Log danh sách sheets
+
+            const results = { 
+                categories: { success: 0, errors: [] },
+                products: { success: 0, errors: [] }
+            };
+
+            // 1. Xử lý sheet danh mục trước
+            if (workbook.SheetNames.includes('Danh mục')) {
+                const categoriesSheet = workbook.Sheets['Danh mục'];
+                const categories = XLSX.utils.sheet_to_json(categoriesSheet);
+                console.log('Categories data:', categories); // Log dữ liệu danh mục
+
+                for (const category of categories) {
+                    try {
+                        const name = category['Tên danh mục'];
+                        if (!name) {
+                            results.categories.errors.push('Tên danh mục không được trống');
+                            continue;
+                        }
+
+                        // Kiểm tra danh mục đã tồn tại
+                        const existingCategory = await new Promise((resolve, reject) => {
+                            db.get('SELECT id FROM categories WHERE LOWER(name) = LOWER(?)', 
+                                [name.trim()], 
+                                (err, row) => {
+                                    if (err) reject(err);
+                                    else resolve(row);
+                                });
+                        });
+
+                        if (!existingCategory) {
+                            await new Promise((resolve, reject) => {
+                                db.run('INSERT INTO categories (name) VALUES (?)', 
+                                    [name.trim()], 
+                                    function(err) {
+                                        if (err) reject(err);
+                                        else {
+                                            results.categories.success++;
+                                            resolve();
+                                        }
+                                    });
+                            });
+                        }
+                    } catch (error) {
+                        console.error('Error importing category:', error);
+                        results.categories.errors.push(`Lỗi thêm danh mục "${category['Tên danh mục']}": ${error.message}`);
+                    }
+                }
+            } else {
+                console.log('No Categories sheet found');
+            }
+
+            // 2. Xử lý sheet sản phẩm
+            if (workbook.SheetNames.includes('Danh sách sản phẩm')) {
+                const productsSheet = workbook.Sheets['Danh sách sản phẩm'];
+                const products = XLSX.utils.sheet_to_json(productsSheet);
+                console.log('Products data:', products); // Log dữ liệu sản phẩm
+
+                for (const product of products) {
+                    try {
+                        const {
+                            'Tên sản phẩm': name,
+                            'Mã vạch': barcode,
+                            'Giá lẻ': retail_price,
+                            'Giá sỉ': wholesale_price,
+                            'Danh mục': category_name
+                        } = product;
+
+                        // Kiểm tra dữ liệu đầu vào
+                        if (!name || name.trim() === '') {
+                            results.products.errors.push('Tên sản phẩm không được trống');
+                            continue;
+                        }
+
+                        if (!retail_price || isNaN(retail_price)) {
+                            results.products.errors.push(`Giá lẻ không hợp lệ cho sản phẩm "${name}"`);
+                            continue;
+                        }
+
+                        if (!category_name || category_name.trim() === '') {
+                            results.products.errors.push(`Danh mục không được trống cho sản phẩm "${name}"`);
+                            continue;
+                        }
+
+                        // Kiểm tra và lấy category_id
+                        const category = await new Promise((resolve, reject) => {
+                            db.get('SELECT id FROM categories WHERE LOWER(name) = LOWER(?)', 
+                                [category_name.trim()], 
+                                (err, row) => {
+                                    if (err) reject(err);
+                                    else resolve(row);
+                                });
+                        });
+
+                        if (!category) {
+                            results.products.errors.push(`Danh mục "${category_name}" không tồn tại cho sản phẩm "${name}"`);
+                            continue;
+                        }
+
+                        // Kiểm tra sản phẩm đã tồn tại
+                        const existingProduct = await new Promise((resolve, reject) => {
+                            db.get('SELECT id FROM products WHERE LOWER(name) = LOWER(?)', 
+                                [name.trim()], 
+                                (err, row) => {
+                                    if (err) reject(err);
+                                    else resolve(row);
+                                });
+                        });
+
+                        if (existingProduct) {
+                            results.products.errors.push(`Sản phẩm "${name}" đã tồn tại`);
+                            continue;
+                        }
+
+                        // Thêm sản phẩm mới
+                        await new Promise((resolve, reject) => {
+                            db.run(`
+                                INSERT INTO products (name, barcode, retail_price, wholesale_price, category_id)
+                                VALUES (?, ?, ?, ?, ?)
+                            `, [name.trim(), barcode, retail_price, wholesale_price || null, category.id], 
+                            function(err) {
+                                if (err) {
+                                    console.error('Error inserting product:', err);
+                                    reject(err);
+                                } else {
+                                    results.products.success++;
+                                    resolve();
+                                }
+                            });
+                        });
+                    } catch (error) {
+                        console.error('Error importing product:', error);
+                        results.products.errors.push(`Lỗi thêm sản phẩm "${product['Tên sản phẩm']}": ${error.message}`);
+                    }
+                }
+            } else {
+                console.log('No Products sheet found');
+            }
+
+            console.log('Import results:', results); // Log kết quả import
+            res.json(results);
+        } catch (error) {
+            console.error('Import error:', error);
+            res.status(500).json({ 
+                error: 'Failed to import data',
+                details: error.message,
+                stack: error.stack
+            });
+        }
     });
 
     return app;

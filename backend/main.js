@@ -18,6 +18,9 @@ async function initializeServer() {
             const port = process.env.PORT || 3001;
             server = app.listen(port, '127.0.0.1', () => {
                 console.log(`Server running at http://localhost:${port}`);
+                console.log('Available routes:', app._router.stack
+                    .filter(r => r.route)
+                    .map(r => `${Object.keys(r.route.methods)} ${r.route.path}`));
                 resolve(true);
             });
 
@@ -36,13 +39,20 @@ async function createWindow() {
     try {
         await initializeServer();
 
+        // Lấy đường dẫn preload script
+        const preloadPath = isDev 
+            ? path.join(__dirname, 'preload.js')
+            : path.join(__dirname, 'preload.js');
+
+        console.log('Preload path:', preloadPath);
+
         mainWindow = new BrowserWindow({
             width: 1200,
             height: 800,
             webPreferences: {
                 nodeIntegration: false,
                 contextIsolation: true,
-                preload: path.join(__dirname, 'preload.js'),
+                preload: preloadPath,
                 webSecurity: false
             }
         });
@@ -53,7 +63,8 @@ async function createWindow() {
             await mainWindow.loadURL('http://localhost:3000');
             mainWindow.webContents.openDevTools();
         } else {
-            const indexPath = path.join(__dirname, 'app', 'index.html');
+            // Sửa đường dẫn để load file từ resources
+            const indexPath = path.join(process.resourcesPath, 'app', 'index.html');
             console.log('Loading index from:', indexPath);
             
             protocol.registerFileProtocol('file', (request, callback) => {
